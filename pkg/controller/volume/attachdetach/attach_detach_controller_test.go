@@ -19,11 +19,17 @@ package attachdetach
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes/fake"
+	core "k8s.io/client-go/testing"
+
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
@@ -34,6 +40,7 @@ import (
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/csi"
 	"k8s.io/kubernetes/pkg/volume/util"
+	volumeutiltypes "k8s.io/kubernetes/pkg/volume/util/types"
 )
 
 const (
@@ -146,6 +153,197 @@ func Test_AttachDetachControllerStateOfWolrdPopulators_Positive(t *testing.T) {
 				pod.Spec.Volumes[0].Name,
 				pod.Spec.NodeName)
 		}
+	}
+}
+
+func getTestingPVCAndPV(claimName,
+	claimNamespace,
+	volumeName string,
+	claimPhase v1.PersistentVolumeClaimPhase) (*v1.PersistentVolumeClaim, *v1.PersistentVolume) {
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: claimNamespace,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			VolumeName: volumeName,
+		},
+		Status: v1.PersistentVolumeClaimStatus{
+			Phase: claimPhase,
+		},
+	}
+
+	if claimPhase == v1.ClaimPending {
+		return pvc, nil
+	}
+
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: volumeName,
+		},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{
+					PDName: "PDName",
+				},
+			},
+			ClaimRef: &v1.ObjectReference{
+				APIVersion: "v1",
+				Kind:       "PersistentVolumeClaim",
+				Name:       claimName,
+				Namespace:  claimNamespace,
+			},
+		},
+	}
+
+	return pvc, pv
+}
+
+func Test_AAA(t *testing.T) {
+	namespace := "ns1"
+	podName := "pod1"
+	pvcName := "pvc1"
+	volumeName := "pv1"
+	nodeName := "node1"
+
+	boundedPVC, boundedPV := getTestingPVCAndPV(pvcName, namespace, volumeName, v1.ClaimBound)
+	lostedPVC, lostedPV := getTestingPVCAndPV(pvcName, namespace, volumeName, v1.ClaimLost)
+	pendingPVC, nonePV := getTestingPVCAndPV(pvcName, namespace, volumeName, v1.ClaimPending)
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       types.UID("pod1uid"),
+			Name:      podName,
+			Namespace: namespace,
+		},
+		Spec: v1.PodSpec{
+			Volumes: []v1.Volume{
+				{
+					Name: "volume1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+			NodeName: nodeName,
+		},
+	}
+
+	csiNode := &storagev1.CSINode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node1",
+		},
+	}
+
+	tests := []struct {
+		CaseName              string
+		PersistentVolumeClaim *v1.PersistentVolumeClaim
+		PersistentVolume      *v1.PersistentVolume
+		Pod                   *v1.Pod
+		ExpectedPodInDSW      *v1.Pod
+	}{
+		{
+			CaseName:              "with bounded PVC and PV",
+			PersistentVolumeClaim: boundedPVC,
+			PersistentVolume:      boundedPV,
+			Pod:                   pod,
+			ExpectedPodInDSW:      pod,
+		},
+		{
+			CaseName:              "with losted PVC and PV",
+			PersistentVolumeClaim: lostedPVC,
+			PersistentVolume:      lostedPV,
+			Pod:                   pod,
+			ExpectedPodInDSW:      nil,
+		},
+		{
+			CaseName:              "with pending PVC and none PV",
+			PersistentVolumeClaim: pendingPVC,
+			PersistentVolume:      nonePV,
+			Pod:                   pod,
+			ExpectedPodInDSW:      nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.CaseName, func(t *testing.T) {
+			fakeKubeClient := &fake.Clientset{}
+			fakePVCWatch := watch.NewFake()
+			fakeKubeClient.AddWatchReactor("persistentvolumeclaims", core.DefaultWatchReactor(fakePVCWatch, nil))
+			fakeWatch := watch.NewFake()
+			fakeKubeClient.AddWatchReactor("*", core.DefaultWatchReactor(fakeWatch, nil))
+
+			informerFactory := informers.NewSharedInformerFactory(fakeKubeClient, 0)
+			pvInformer := informerFactory.Core().V1().PersistentVolumes().Informer()
+			podInformer := informerFactory.Core().V1().Pods().Informer()
+			csiNodeInformer := informerFactory.Storage().V1().CSINodes().Informer()
+
+			// Create the controller
+			plugins := controllervolumetesting.CreateTestPlugin()
+			adcObj, err := NewAttachDetachController(
+				fakeKubeClient,
+				informerFactory.Core().V1().Pods(),
+				informerFactory.Core().V1().Nodes(),
+				informerFactory.Core().V1().PersistentVolumeClaims(),
+				informerFactory.Core().V1().PersistentVolumes(),
+				informerFactory.Storage().V1().CSINodes(),
+				informerFactory.Storage().V1().CSIDrivers(),
+				informerFactory.Storage().V1().VolumeAttachments(),
+				nil, /* cloud */
+				plugins,
+				nil, /* dynamic prober */
+				false,
+				1*time.Second,
+				DefaultTimerConfig,
+				nil, /* filteredDialOptions */
+			)
+
+			if err != nil {
+				t.Fatalf("Run failed with error. Expected: <no error> Actual: <%v>", err)
+			}
+
+			stop := make(chan struct{})
+			defer close(stop)
+			informerFactory.Start(stop)
+			informerFactory.WaitForCacheSync(stop)
+			csiNodeInformer.GetIndexer().Add(csiNode)
+
+			if test.PersistentVolumeClaim != nil {
+				fakePVCWatch.Add(test.PersistentVolumeClaim)
+			}
+			if test.PersistentVolume != nil {
+				pvInformer.GetIndexer().Add(test.PersistentVolume)
+			}
+			if test.Pod != nil {
+				podInformer.GetIndexer().Add(pod)
+			}
+
+			adc := adcObj.(*attachDetachController)
+			defer adc.pvcQueue.ShutDown()
+			adc.GetDesiredStateOfWorld().AddNode(types.NodeName(nodeName), false)
+			go adc.pvcWorker()
+
+			time.Sleep(time.Second)
+
+			pods := adc.GetDesiredStateOfWorld().GetPodToAdd()
+
+			if test.ExpectedPodInDSW == nil && len(pods) != 0 {
+				t.Errorf("1")
+			}
+
+			if test.ExpectedPodInDSW != nil && len(pods) != 1 {
+				t.Errorf("2")
+			}
+
+			if test.ExpectedPodInDSW != nil {
+				podInDSW := pods[volumeutiltypes.UniquePodName(test.ExpectedPodInDSW.GetName())]
+				if reflect.DeepEqual(test.ExpectedPodInDSW, podInDSW) {
+					t.Errorf("3")
+				}
+			}
+		})
 	}
 }
 
